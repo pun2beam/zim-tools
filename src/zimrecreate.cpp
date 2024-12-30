@@ -27,7 +27,7 @@
 #include <list>
 #include <algorithm>
 #include <sstream>
-
+#include <fstream> // 追加
 #include "tools.h"
 #include "version.h"
 
@@ -95,8 +95,49 @@ class PatchItem : public zim::writer::Item
   }
 };
 
+void printMetaData(const std::string& originFilename, bool withFtIndexFlag, unsigned long nbThreads)
+{
 
-void create(const std::string& originFilename, const std::string& outFilename, bool withFtIndexFlag, unsigned long nbThreads)
+  zim::Archive origin(originFilename);
+  std::cout << "Metadata:" << std::endl;
+  
+  for(auto& metakey:origin.getMetadataKeys()) {
+    auto metadata = origin.getMetadata(metakey);
+    
+    if (metakey.find("Illustration_") == 0) {
+      // binary value
+      std::cout << metakey <<":(binary data)" << std::endl;
+    }else{
+      std::cout << metakey <<":" << metadata << std::endl;
+    }
+  }
+}
+zim::Blob createBlobFromFile(const std::string& filePath) {
+    // ファイルをバイナリモードで開く
+    std::ifstream file(filePath, std::ios::binary);
+
+    // ファイルが開けなかった場合のエラーハンドリング
+    if (!file) {
+        throw std::runtime_error("Failed to open file: " + filePath);
+    }
+
+    // ファイルサイズを取得
+    file.seekg(0, std::ios::end);
+    size_t size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    // バッファにファイル内容を読み込む
+    std::vector<char> buffer(size);
+    file.read(buffer.data(), size);
+
+    // vectorの内部ポインタを使ってstd::shared_ptr<const char>を作成
+    std::shared_ptr<const char> constBuffer(buffer.data(), [](const char*) {});
+
+    // Blobオブジェクトを作成して返す
+    return zim::Blob(constBuffer, size);
+}
+
+void create(const std::string& originFilename, const std::string& outFilename, bool withFtIndexFlag, unsigned long nbThreads,std::map<std::string, std::string> newMetadata)
 {
   zim::Archive origin(originFilename);
   zim::writer::Creator zimCreator;
@@ -119,22 +160,52 @@ void create(const std::string& originFilename, const std::string& outFilename, b
     zimCreator.setMainPath(mainPath);
   } catch(...) {}
 
-  try {
-    auto illustration = origin.getIllustrationItem();
-    zimCreator.addIllustration(48, illustration.getData());
-  } catch(...) {}
+  // try {
+  //   auto illustration = origin.getIllustrationItem();
+  //   zimCreator.addIllustration(48, illustration.getData());
+  // } catch(...) {}
 
+  // add original metadata(replace if newMetadata exist)
   for(auto& metakey:origin.getMetadataKeys()) {
-    if (metakey == "Counter" || metakey.find("Illustration_") == 0) {
+    if (metakey == "Counter") {
       // Counter is already added by libzim
       // Illustration is already handled by `addIllustration`
       continue;
     }
-    auto metadata = origin.getMetadata(metakey);
+    if(metakey.find("Illustration_") == 0){
+      zim::Blob IllustBlob;
+      if(newMetadata.find(metakey) != newMetadata.end()){
+        IllustBlob=createBlobFromFile(newMetadata[metakey]);
+      }else{
+        auto illustration = origin.getIllustrationItem();
+        IllustBlob=illustration.getData();
+      }
+      zimCreator.addIllustration(48, IllustBlob);
+      continue;
+    }
+    std::string metadata;
+    if(newMetadata.find(metakey) != newMetadata.end()){
+      metadata = newMetadata[metakey];
+    }else{
+      metadata = origin.getMetadata(metakey);
+    }
+    std::cout << "  "<< metakey << ":" << metadata << std::endl;
     auto metaProvider = std::unique_ptr<zim::writer::ContentProvider>(new zim::writer::StringProvider(metadata));
     zimCreator.addMetadata(metakey, std::move(metaProvider), "text/plain");
   }
+  // add new metadata(if original medadata not exist)
+  for (const auto& pair : newMetadata) {
+    std::vector<std::string> existingKeys = origin.getMetadataKeys();
+    auto it = std::find(existingKeys.begin(), existingKeys.end(), pair.first);
 
+    if (it == existingKeys.end()) {
+        auto metaProvider = std::unique_ptr<zim::writer::ContentProvider>(
+            new zim::writer::StringProvider(pair.second)
+        );
+        std::cout << "  "<< pair.first << ":" << pair.second << std::endl;
+        zimCreator.addMetadata(pair.first, std::move(metaProvider), "text/plain");
+    }
+  }
 
   for(auto& entry:origin.iterEfficient()) {
     if (fromNewNamespace) {
@@ -169,6 +240,35 @@ void create(const std::string& originFilename, const std::string& outFilename, b
   }
   zimCreator.finishZimCreation();
 }
+// Parse a single key-value pair string
+std::pair<std::string, std::string> parseKeyValuePair(const std::string& pair) {
+    size_t colonPos = pair.find(':');
+    if (colonPos == std::string::npos) {
+        throw std::invalid_argument("Invalid key-value pair format: " + pair);
+    }
+    std::string key = pair.substr(0, colonPos);
+    std::string value = pair.substr(colonPos + 1);
+    return {key, value};
+}
+
+// Parse the entire input string
+std::map<std::string, std::string> parseInputString(const std::string& input) {
+    std::map<std::string, std::string> result;
+
+    size_t start = 0, end = 0;
+    while ((start = input.find('{', end)) != std::string::npos) {
+        end = input.find('}', start);
+        if (end == std::string::npos) {
+            throw std::invalid_argument("Mismatched braces in input string");
+        }
+
+        std::string segment = input.substr(start + 1, end - start - 1);
+        auto keyValue = parseKeyValuePair(segment);
+        result[keyValue.first] = keyValue.second;
+    }
+
+    return result;
+}
 
 void usage()
 {
@@ -176,6 +276,8 @@ void usage()
     "\nUsage: zimrecreate ORIGIN_FILE OUTPUT_FILE [Options]"
     "\nOptions:\n"
     "\t-v, --version           print software version\n"
+    "\t-mp, --metadataprint    print metadata \n"
+    "\t-ms, --metadataset      use metadata insted \n"
     "\t-j, --withoutFTIndex    don't create and add a fulltext index of the content to the ZIM\n"
     "\t-J, --threads <number>  count of threads to utilize (default: 4)\n"
     "\nReturn value:\n"
@@ -188,7 +290,9 @@ void usage()
 int main(int argc, char* argv[])
 {
     bool withFtIndexFlag = true;
+    bool metadataPrintFlag = false;
     unsigned long nbThreads = 4;
+    std::map<std::string, std::string> metadata;
 
     //Parsing arguments
     //There will be only two arguments, so no detailed parsing is required.
@@ -202,13 +306,29 @@ int main(int argc, char* argv[])
             return 0;
         }
 
+        if(std::string(argv[i])=="--metadataprint" ||
+           std::string(argv[i])=="-mp")
+        {
+            metadataPrintFlag = true;
+        }
+        
+        if(std::string(argv[i])=="--metadataset" ||
+           std::string(argv[i])=="-ms")
+        {
+            if(argc<=i+1)
+            {
+                std::cout << std::endl << "[ERROR] Not enough Arguments provided" << std::endl;
+                usage();
+                return -1;
+            }
+            metadata = parseInputString(argv[i+1]);
+        }
         if(std::string(argv[i])=="--version" ||
            std::string(argv[i])=="-v")
         {
             printVersions();
             return 0;
         }
-
         if(std::string(argv[i])=="--withoutFTIndex" ||
            std::string(argv[i])=="-j")
         {
@@ -218,7 +338,7 @@ int main(int argc, char* argv[])
         if(std::string(argv[i])=="-J" ||
            std::string(argv[i])=="--threads")
         {
-            if(argc<5)
+            if(argc<=i+1)
             {
                 std::cout << std::endl << "[ERROR] Not enough Arguments provided" << std::endl;
                 usage();
@@ -244,10 +364,16 @@ int main(int argc, char* argv[])
         return -1;
     }
     std::string originFilename = argv[1];
+
+    if(metadataPrintFlag){
+        printMetaData(originFilename, withFtIndexFlag, nbThreads);
+        return 0;
+    }
+
     std::string outputFilename = argv[2];
     try
     {
-        create(originFilename, outputFilename, withFtIndexFlag, nbThreads);
+        create(originFilename, outputFilename, withFtIndexFlag, nbThreads, metadata);
     }
     catch (const std::exception& e)
     {
